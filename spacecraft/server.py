@@ -1,12 +1,14 @@
-# -*- coding: utf-8 *-*
+# -*- coding: utf-8 -*-
 import json
 
 from twisted.protocols.basic import LineReceiver
 from twisted.internet.protocol import Factory
 from twisted.application import service, internet
 from twisted.python import usage, log
-from twisted.internet import reactor
-from twisted.web import static, server
+from twisted.internet import reactor, interfaces
+from twisted.web import static, server, resource
+
+from zope.interface import implements
 
 from spacecraft import world, map
 
@@ -159,6 +161,89 @@ class MonitorFactory(ClientFactory):
     protocol = Monitor
 
 
+class HTTPMonitorProducer(Monitor):
+    #XXX subclassing Monitor feels wrong, HTTPMonitorProducer doesnt need to
+    # be a LineReceiver
+    """A Monitor publishing game events through HTTP requests
+    Use request.registerProducer for attaching a producer to the request
+    object.
+    
+    We are speaking the Server-Sent Events protocol
+    (http://dev.w3.org/html5/eventsource/.) In a nutshell:
+
+        * One direction protocol, client listens to server generated events
+        * The body format is '<field>: <message>\n\n'
+        * Field can be one of id, data, event, retry
+        * Messages can be multiline, message delimiter is '\n\n'
+
+    HTTP clients can listen to events through EventSource objects exposed
+    in the HTML5 JavaScript API:
+            
+        var e = EventSource("/events"); 
+        e.addEventListener('message',
+            function (event) { 
+                console.log(JSON.parse(event.data)) 
+            }, false);
+
+    """
+    implements(interfaces.IPushProducer)
+    _delimiter = "\n\n"
+
+    def __init__(self, request, game):
+        self.request = self.transport = request
+        self.register(game)
+        self._paused = False
+
+    ## IPushProducer interface
+
+    def pauseProducing(self):
+        """Called when buffers are filled
+        
+        """
+        self._paused = True
+
+    def resumeProducing(self):
+        """Resume data streaming
+        
+        """
+        self._paused = False
+
+    def stopProducing(self):
+        """Stop streaming data
+        
+        """
+        self.request.unregisterProducer()
+        self.request.finish()
+
+    ## Client interface
+
+    def sendLine(self, line):
+        """Write message to the client
+        
+        """
+        if not self._paused:
+            data = "data: {0}{1}".format(line, self._delimiter)
+            self.request.write(data)
+
+
+class HTTPMonitorResource(resource.Resource):
+
+    def __init__(self, game):
+        resource.Resource.__init__(self)
+        self.game = game
+
+    def render_GET(self, request):
+        """Answer GET requests with the event stream, attaching a producer to
+        the request object (consumer)
+        
+        """
+        request.setHeader("Content-Type", "text/event-stream")
+        producer = HTTPMonitorProducer(request, self.game)
+        request.registerProducer(producer, True)
+        producer.resumeProducing()
+        return server.NOT_DONE_YET
+ 
+
 class Options(usage.Options):
     optParameters = [
         ["monitorport", "m", 11105,
@@ -167,10 +252,10 @@ class Options(usage.Options):
             "The port number to listen on for players.", int],
         ["httpport", "p", 11107,
             "The port number to listen on for http requests.", int],
-
+ 
         ["xsize", "x", 100,
             "The map x size.", int],
-        ["ysize", "y", 100,
+        ["ysize", "y", 101,
             "The map y size.", int],
         ["start", "s", False,
             "Put the game in running mode as soon as the server starts.""",
@@ -196,7 +281,7 @@ def makeService(options):
         options['monitorport'], MonitorFactory(game))
     monitor_service.setName("monitors")
     monitor_service.setServiceParent(root_service)
-
+  
     player_service = internet.TCPServer(
         options['playerport'], PlayerFactory(game))
     player_service.setName("players")
@@ -204,6 +289,7 @@ def makeService(options):
 
     # add web service
     root_resource = static.File("static/")
+    root_resource.putChild("events", HTTPMonitorResource(game))
     site = server.Site(root_resource)
     web_service = internet.TCPServer(options['httpport'], site)
     web_service.setServiceParent(root_service)
